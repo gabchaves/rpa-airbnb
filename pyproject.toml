@@ -1,0 +1,15 @@
+[project]
+name = "raspagem-airbnb"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "firecrawl-py>=4.14.1",
+    "lxml>=6.0.2",
+    "openpyxl>=3.1.5",
+    "pandas>=3.0.0",
+    "playwright>=1.58.0",
+    "python-dotenv>=1.2.1",
+]
