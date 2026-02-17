@@ -59,10 +59,19 @@ class ScraperPaths:
     debug_screenshot_file: Path
 
 
-def build_paths(city: str) -> ScraperPaths:
+def build_paths(city: str, output_folder: str = "") -> ScraperPaths:
     slug = city_slug(city)
+    
+    # Se pasta de saida foi definida, usa ela. Senao usa DATA_DIR
+    base_out = Path(output_folder) if output_folder else DATA_DIR
+    base_out.mkdir(parents=True, exist_ok=True)
+    
+    # Mantem caches internos na pasta do app sempre, pra nao sujar a pasta do usuario
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
     return ScraperPaths(
-        output_file=DATA_DIR / f"perfis_airbnb_{slug}.xlsx",
+        output_file=base_out / f"perfis_airbnb_{slug}.xlsx",
         discovered_urls_file=DATA_DIR / f"urls_descobertas_{slug}.txt",
         debug_screenshot_file=DEBUG_DIR / f"erro_busca_{slug}.png",
     )
@@ -71,7 +80,10 @@ def build_paths(city: str) -> ScraperPaths:
 def load_discovered_urls(path: Path) -> Set[str]:
     if not path.exists():
         return set()
-    return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+    try:
+        return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+    except:
+        return set()
 
 
 def save_discovered_urls(path: Path, urls: Set[str]) -> None:
@@ -98,47 +110,46 @@ def load_processed_urls(path: Path) -> Set[str]:
 
 def parse_listings_count(text: str) -> int:
     """
-    Tenta extrair o numero total de anuncios a partir de textos como:
-    'Mostrando x de y itens', 'Show x of y items' ou apenas 'y anuncios'.
+    Refinado para evitar falsos positivos (como pegar '11' de datas ou precos).
     """
     if not text:
         return 0
         
     normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").lower()
     
-    # Padroes comuns
+    # Padroes estritos: OBRIGATORIO ter 'listing', 'anuncio', 'acomodacao', 'item'
     patterns = [
         r"(?:de|of)\s+([\d\.\,]+)\s+(?:itens|items|listings|anuncios|acomodacoes)",
         r"mostrando.*?([\d\.\,]+)\s+(?:itens|items)",
-        r"([\d\.\,]+)\s+(?:anuncios|listings|acomodacoes)"
+        r"([\d\.\,]+)\s+(?:anuncios|listings|acomodacoes|places)",
+        r"(\d+)\s+(?:listings|anuncios)"
     ]
     
     for pattern in patterns:
         match = re.search(pattern, normalized, re.IGNORECASE)
         if match:
-            # Remove pontos e virgulas e converte
             val_str = re.sub(r"[^\d]", "", match.group(1))
             if val_str.isdigit():
                 return int(val_str)
-                
-    # Fallback: apenas numeros no texto
-    digits_only = re.sub(r"[^\d]", "", normalized)
-    if digits_only and len(digits_only) < 5: 
-        return int(digits_only)
-        
+    
+    # Se nao achou padrao explicito, retorna 0 para evitar chutar "11" de "Nov 11"
     return 0
 
 
 class SeleniumScraper:
-    def __init__(self, city: str, target_count: int, headless: bool, log_callback: LogCallback = None):
+    def __init__(self, city: str, target_count: int, headless: bool, log_callback: LogCallback = None, output_folder: str = ""):
         self.city = normalize_city(city)
         self.target_count = max(1, int(target_count))
         self.headless = headless
         self.log_callback = log_callback
+        self.output_folder = output_folder
         self.search_url = build_search_url(self.city)
-        self.paths = build_paths(self.city)
+        self.paths = build_paths(self.city, output_folder=self.output_folder)
 
+        # Tenta carregar existente se houver no destino
         self.output_df = load_existing_dataframe(self.paths.output_file)
+        
+        # Cache de URLs processadas sempre fica na pasta do app para controle interno
         self.processed_urls = load_processed_urls(self.paths.output_file)
         self.discovered_urls = load_discovered_urls(self.paths.discovered_urls_file)
         
@@ -187,15 +198,26 @@ class SeleniumScraper:
             return
 
         df_new = pd.DataFrame(rows)
-        if self.output_df.empty:
-            self.output_df = df_new
+        # Recarrega em memoria caso tenha mudado
+        if os.path.exists(self.paths.output_file):
+            try:
+                current_df = pd.read_excel(self.paths.output_file)
+                self.output_df = pd.concat([current_df, df_new], ignore_index=True)
+            except:
+                pass
         else:
-            self.output_df = pd.concat([self.output_df, df_new], ignore_index=True)
+             if self.output_df.empty:
+                self.output_df = df_new
+             else:
+                self.output_df = pd.concat([self.output_df, df_new], ignore_index=True)
 
         self.output_df.drop_duplicates(subset="source_url", keep="last", inplace=True)
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Garante pasta de saida
+        self.paths.output_file.parent.mkdir(parents=True, exist_ok=True)
+        
         self.output_df.to_excel(self.paths.output_file, index=False)
-        log(f"Checkpoint salvo ({len(self.output_df)} registros).", self.log_callback)
+        log(f"Checkpoint salvo em: {self.paths.output_file.name}", self.log_callback)
 
     def run(self) -> None:
         try:
@@ -204,14 +226,11 @@ class SeleniumScraper:
             pending_urls = list(self.discovered_urls - self.processed_urls)
 
             log(f"Cidade: {self.city}", self.log_callback)
-            log(f"URL de busca: {self.search_url}", self.log_callback)
-            log(f"Ja processadas: {len(self.processed_urls)}", self.log_callback)
-            log(f"URLs conhecidas: {len(self.discovered_urls)}", self.log_callback)
             
             # Se precisamos de mais URLs, tenta descobrir
             if len(pending_urls) < self.target_count:
                 need = self.target_count - len(pending_urls)
-                max_new = max(need + 5, 10)
+                max_new = max(need + 5, 20)
                 new_urls = self.discover_listings(max_new=max_new)
                 
                 if new_urls:
@@ -236,11 +255,11 @@ class SeleniumScraper:
                 data = self.scrape_profile(url)
                 
                 if data and data['host_profile_url']:
-                    buffer.append(data)
+                    buffer.append(data) # Adiciona ao buffer local
                     self.processed_urls.add(url)
                     log(f"Sucesso: {data['host_name']} ({data['host_listings_count']} anuncios)", self.log_callback)
                 else:
-                    log("Falha ou dados completados no fallback.", self.log_callback)
+                    log("Falha ou dados incompletos.", self.log_callback)
                 
                 # Salva checkpoint
                 if len(buffer) >= CHECKPOINT_SIZE:
@@ -248,12 +267,12 @@ class SeleniumScraper:
                     buffer.clear()
 
                 # OTIMIZACAO 3: Menos tempo ocioso
-                time.sleep(random.uniform(1.0, 2.0))
+                time.sleep(random.uniform(0.5, 1.5))
 
             if buffer:
                 self.flush_buffer(buffer)
 
-            log(f"Finalizado. Arquivo salvo em: {self.paths.output_file}", self.log_callback)
+            log(f"Finalizado! Arquivo salvo em:\n{self.paths.output_file}", self.log_callback)
             
         except Exception as e:
             log(f"Erro fatal no processo: {e}", self.log_callback)
@@ -301,9 +320,19 @@ class SeleniumScraper:
                 # Tentar ir para proxima pagina
                 try:
                     # Tenta achar o botao rapidamente
-                    next_btn = self.driver.find_element(By.CSS_SELECTOR, "a[aria-label*='Proximo'], a[aria-label*='Next']")
-                    if next_btn.is_enabled():
-                        self.driver.execute_script("arguments[0].click();", next_btn)
+                    # Seletor amplo para pegar botao next em pt, en, es
+                    next_btns = self.driver.find_elements(By.CSS_SELECTOR, "a[aria-label*='Proximo'], a[aria-label*='Next'], a[aria-label*='Siguiente']")
+                    clicked = False
+                    for btn in next_btns:
+                        if btn.is_displayed() and btn.is_enabled():
+                            try:
+                                self.driver.execute_script("arguments[0].click();", btn)
+                                clicked = True
+                                break
+                            except:
+                                pass
+                    
+                    if clicked:
                         time.sleep(3) # Unico sleep mais longo necessario p/ troca de pagina
                         page_number += 1
                     else:
@@ -321,9 +350,20 @@ class SeleniumScraper:
         try:
             self.driver.get(listing_url)
             
-            # --- 1. PEGAR TITULO (Opcional) ---
+            # --- 1. PEGAR TITULO (Refinado) ---
             listing_title = "Titulo nao capturado"
-            # Removidos try/catches lentos desnecessarios para titulo
+            xpath_title_user = "/html/body/div[5]/div/div/div[1]/div/div/div[1]/div[2]/div/div/div/div[1]/div[2]/div[1]/div[1]/div[3]/div/div/div/div/div/section/div/div/div/h1"
+            
+            try:
+                # Tenta XPath exato primeiro
+                title_el = self.driver.find_element(By.XPATH, xpath_title_user)
+                listing_title = title_el.text.strip()
+            except:
+                try:
+                    # Fallback H1 generico
+                    listing_title = self.driver.find_element(By.TAG_NAME, "h1").text.strip()
+                except:
+                    pass
 
             # --- 2. FECHAR MODAIS (Importante para clicar) ---
             # OTIMIZACAO: JS direto, mais rapido que find_element + click
@@ -332,7 +372,6 @@ class SeleniumScraper:
                 if(btn) btn.click();
             """)
             
-            # Rolar um pouco para garantir que elementos aparecam
             self.driver.execute_script("window.scrollBy(0, 800);")
             time.sleep(0.5)
 
@@ -347,7 +386,7 @@ class SeleniumScraper:
 
             target_el = None
             
-            log("Buscando link...", self.log_callback)
+            # log("Buscando link...", self.log_callback)
             try:
                 # Tenta esperar o aria-label primeiro (mais confiavel visualmente)
                 target_el = WebDriverWait(self.driver, 4).until(
@@ -383,7 +422,6 @@ class SeleniumScraper:
                     self.driver.get(host_profile_url)
 
             if not host_profile_url:
-                log("URL do perfil nao encontrada. Pulando...", self.log_callback)
                 # Tenta fallback para link direto se nao achou o botao
                 try: 
                    fallback_el = self.driver.find_element(By.XPATH, "//a[contains(@href, '/users/show/')]")
@@ -399,7 +437,6 @@ class SeleniumScraper:
                 host_profile_url = host_profile_url.split("?")[0]
 
             # --- 4. EXTRAIR DADOS DO PERFIL ---
-            # log("Extraindo dados...", self.log_callback)
             
             host_name = "Nao encontrado"
             listings_count = 0
@@ -429,6 +466,10 @@ class SeleniumScraper:
             except Exception:
                 pass
 
+            # Se a contagem for 0, mas achamos o h1 do perfil, assume pelo menos 1
+            if listings_count == 0 and host_name != "Nao encontrado":
+                 listings_count = 1
+
             return {
                 "city": self.city,
                 "listing_title": listing_title,
@@ -449,8 +490,9 @@ def run_scraper(
     city: str = DEFAULT_CITY,
     headless: bool = True,
     log_callback: LogCallback = None,
+    output_folder: str = ""
 ) -> None:
-    scraper = SeleniumScraper(city=city, target_count=target_count, headless=headless, log_callback=log_callback)
+    scraper = SeleniumScraper(city=city, target_count=target_count, headless=headless, log_callback=log_callback, output_folder=output_folder)
     scraper.run()
 
 
