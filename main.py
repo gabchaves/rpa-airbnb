@@ -148,8 +148,7 @@ class SeleniumScraper:
         log("Configurando Driver Selenium...", self.log_callback)
         options = ChromeOptions()
         if self.headless:
-            # options.add_argument("--headless=new") # Comentado por seguranca
-            pass
+            options.add_argument("--headless=new")
         
         options.add_argument("--disable-gpu")
         options.add_argument("--no-sandbox")
@@ -401,6 +400,8 @@ class SeleniumScraper:
                     EC.presence_of_element_located((By.XPATH, xpath_name))
                 )
                 host_name = name_el.text.strip()
+                # Limpeza de prefixos comuns
+                host_name = re.sub(r"^(Acomodações de|Listings by|Accommodations by)\s+", "", host_name, flags=re.IGNORECASE).strip()
             except Exception:
                 # Fallback simples pro H1
                 try:
