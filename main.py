@@ -145,8 +145,12 @@ class SeleniumScraper:
         self.driver = None
 
     def setup_driver(self):
-        log("Configurando Driver Selenium...", self.log_callback)
+        log("Configurando Driver Selenium (High Speed)...", self.log_callback)
         options = ChromeOptions()
+        
+        # OTIMIZACAO 1: Eager Loading (Nao espera assets pesados entrarem)
+        options.page_load_strategy = 'eager'
+        
         if self.headless:
             options.add_argument("--headless=new")
         
@@ -157,6 +161,10 @@ class SeleniumScraper:
         options.add_argument("--log-level=3")
         options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
+        # OTIMIZACAO 2: Bloquear imagens (Economiza muita banda/tempo)
+        prefs = {"profile.managed_default_content_settings.images": 2}
+        options.add_experimental_option("prefs", prefs)
+
         # Evita deteccao basica
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -164,7 +172,7 @@ class SeleniumScraper:
 
         service = ChromeService(ChromeDriverManager().install())
         self.driver = webdriver.Chrome(service=service, options=options)
-        self.driver.set_page_load_timeout(60)
+        self.driver.set_page_load_timeout(30) # Timeout menor ja que estamos em eager
 
     def close_driver(self):
         if self.driver:
@@ -239,7 +247,8 @@ class SeleniumScraper:
                     self.flush_buffer(buffer)
                     buffer.clear()
 
-                time.sleep(random.uniform(2.0, 4.0))
+                # OTIMIZACAO 3: Menos tempo ocioso
+                time.sleep(random.uniform(1.0, 2.0))
 
             if buffer:
                 self.flush_buffer(buffer)
@@ -258,15 +267,15 @@ class SeleniumScraper:
         log(f"Buscando listagens na pagina de busca...", self.log_callback)
         try:
             self.driver.get(self.search_url)
-            time.sleep(5) 
+            # Removemos sleeps longos fixos
             
             while len(new_urls) < max_new:
                 log(f"Varrendo pagina de busca {page_number}...", self.log_callback)
                 
-                # Scroll para carregar itens (lazy load)
-                for _ in range(5):
-                    self.driver.execute_script("window.scrollBy(0, 1000);")
-                    time.sleep(1.0)
+                # Scroll mais rapido (menos iteracoes, maior salto)
+                for _ in range(3):
+                    self.driver.execute_script("window.scrollBy(0, 1500);")
+                    time.sleep(0.5)
 
                 # Busca links padrao do Airbnb (/rooms/...)
                 # Seletor generico mas confiavel
@@ -291,10 +300,11 @@ class SeleniumScraper:
                 
                 # Tentar ir para proxima pagina
                 try:
+                    # Tenta achar o botao rapidamente
                     next_btn = self.driver.find_element(By.CSS_SELECTOR, "a[aria-label*='Proximo'], a[aria-label*='Next']")
                     if next_btn.is_enabled():
-                        next_btn.click()
-                        time.sleep(5) # Espera carregar nova pagina
+                        self.driver.execute_script("arguments[0].click();", next_btn)
+                        time.sleep(3) # Unico sleep mais longo necessario p/ troca de pagina
                         page_number += 1
                     else:
                         break
@@ -313,24 +323,18 @@ class SeleniumScraper:
             
             # --- 1. PEGAR TITULO (Opcional) ---
             listing_title = "Titulo nao capturado"
-            try:
-                WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "h1")))
-                listing_title = self.driver.find_element(By.TAG_NAME, "h1").text
-            except:
-                pass
+            # Removidos try/catches lentos desnecessarios para titulo
 
             # --- 2. FECHAR MODAIS (Importante para clicar) ---
-            try:
-                close_btn = self.driver.find_element(By.CSS_SELECTOR, "button[aria-label='Fechar']")
-                close_btn.click()
-                time.sleep(1)
-            except:
-                pass
+            # OTIMIZACAO: JS direto, mais rapido que find_element + click
+            self.driver.execute_script("""
+                const btn = document.querySelector("button[aria-label='Fechar']");
+                if(btn) btn.click();
+            """)
             
             # Rolar um pouco para garantir que elementos aparecam
-            for _ in range(3):
-                self.driver.execute_script("window.scrollBy(0, 700);")
-                time.sleep(0.5)
+            self.driver.execute_script("window.scrollBy(0, 800);")
+            time.sleep(0.5)
 
             # --- 3. LOCALIZAR LINK DO PERFIL (XPATH DO USUARIO) ---
             host_profile_url = None
@@ -338,82 +342,89 @@ class SeleniumScraper:
             # XPATHS DE BUSCA
             # 1. O XPath exato que voce mandou
             xpath_user = "/html/body/div[5]/div/div/div[1]/div/div/div[1]/div[2]/div/div/div/div[1]/div[2]/div[1]/div[1]/div[14]/div/div/div/div[2]/section/div/div/div[2]/div[1]/div[2]/a"
-            
             # 2. Fallback baseado no aria-label (da sua imagem)
             xpath_aria = "//a[@aria-label='Acessar o perfil completo do anfitrião']"
 
             target_el = None
             
-            log("Buscando link do perfil...", self.log_callback)
-            
-            # Tentativa 1: Aria Label (Mais robusto)
+            log("Buscando link...", self.log_callback)
             try:
-                target_el = self.driver.find_element(By.XPATH, xpath_aria)
-                log("Perfil encontrado pelo aria-label (imagem).", self.log_callback)
+                # Tenta esperar o aria-label primeiro (mais confiavel visualmente)
+                target_el = WebDriverWait(self.driver, 4).until(
+                    EC.presence_of_element_located((By.XPATH, xpath_aria))
+                )
             except:
-                # Tentativa 2: XPath absoluto do usuario
                 try:
+                    # Fallback pro XPath absoluto
                     target_el = self.driver.find_element(By.XPATH, xpath_user)
-                    log("Perfil encontrado pelo XPath absoluto.", self.log_callback)
                 except:
                     pass
 
             if target_el:
-                # Rola ate ele
-                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target_el)
-                time.sleep(1)
-                
-                # Tenta pegar href
+                # OTIMIZACAO: Tentar pegar href direto primeiro sem scroll/clique se possivel
                 host_profile_url = target_el.get_attribute("href")
                 
-                # Se nao tiver href ou for vazio, clica
                 if not host_profile_url:
+                    # Se falhar href, ai sim fazemos a interacao pesada
+                    self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target_el)
                     try:
-                        target_el.click()
-                    except:
                         self.driver.execute_script("arguments[0].click();", target_el)
+                    except:
+                        target_el.click()
                     
-                    time.sleep(3)
-                    host_profile_url = self.driver.current_url
+                    # Espera url mudar
+                    try:
+                        WebDriverWait(self.driver, 5).until(lambda d: "/users/" in d.current_url)
+                        host_profile_url = self.driver.current_url
+                    except:
+                        pass
                 else:
+                    # Navegacao direta e mais rapida
                     self.driver.get(host_profile_url)
-                    time.sleep(3)
 
             if not host_profile_url:
-                log("ATENCAO: URL do perfil nao encontrada. Pulando...", self.log_callback)
+                log("URL do perfil nao encontrada. Pulando...", self.log_callback)
+                # Tenta fallback para link direto se nao achou o botao
+                try: 
+                   fallback_el = self.driver.find_element(By.XPATH, "//a[contains(@href, '/users/show/')]")
+                   host_profile_url = fallback_el.get_attribute("href")
+                   self.driver.get(host_profile_url)
+                except:
+                   return None
+
+            if not host_profile_url:
                 return None
             
-            # Limpa URL se vier suja
             if "?" in host_profile_url:
                 host_profile_url = host_profile_url.split("?")[0]
 
             # --- 4. EXTRAIR DADOS DO PERFIL ---
-            log("Extraindo dados do perfil...", self.log_callback)
+            # log("Extraindo dados...", self.log_callback)
             
             host_name = "Nao encontrado"
             listings_count = 0
             
-            # --- Nome: //*[@id="listings-scroller-heading"]/span ---
+            # --- Nome ---
             xpath_name = '//*[@id="listings-scroller-heading"]/span'
             try:
-                name_el = WebDriverWait(self.driver, 10).until(
+                # Espera reduzida
+                name_el = WebDriverWait(self.driver, 5).until(
                     EC.presence_of_element_located((By.XPATH, xpath_name))
                 )
                 host_name = name_el.text.strip()
-                # Limpeza de prefixos comuns
                 host_name = re.sub(r"^(Acomodações de|Listings by|Accommodations by)\s+", "", host_name, flags=re.IGNORECASE).strip()
             except Exception:
-                # Fallback simples pro H1
+                 # Fallback pro H1
                 try:
                     host_name = self.driver.find_element(By.TAG_NAME, "h1").text.replace("Sobre ", "").strip()
                 except:
                     pass
 
-            # --- Contagem: //*[@id="listings-scroller-description"] ---
+            # --- Contagem ---
             xpath_count = '//*[@id="listings-scroller-description"]'
             try:
                 count_el = self.driver.find_element(By.XPATH, xpath_count)
-                count_text = count_el.text # "Mostrando x de y itens"
+                count_text = count_el.text 
                 listings_count = parse_listings_count(count_text)
             except Exception:
                 pass
@@ -429,7 +440,7 @@ class SeleniumScraper:
             }
 
         except Exception as e:
-            log(f"Erro: {e}", self.log_callback)
+            log(f"Erro URL: {str(e)[:50]}...", self.log_callback) # Log mais curto
             return None
 
 
