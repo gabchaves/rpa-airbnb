@@ -1,12 +1,13 @@
 [project]
 name = "raspagem-airbnb"
 version = "0.1.0"
-description = "Add your description here"
+description = "Raspador de Airbnb com Selenium e GUI"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "customtkinter>=5.2.2",
     "openpyxl>=3.1.5",
     "pandas>=3.0.0",
-    "playwright>=1.58.0",
+    "selenium>=4.18.0",
+    "webdriver-manager>=4.0.0",
 ]
